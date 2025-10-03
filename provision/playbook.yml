@@ -2,68 +2,179 @@
 - name: Setup SportStore environment
   hosts: all
   become: true
+  vars:
+    mssql_sa_password: "devopMySecurePassword123!"
+    ubuntu_version: "22.04"
 
   tasks:
-    - name: Update apt packages
-      apt:
-        update_cache: yes
-        upgrade: yes
-
-    - name: Install required dependencies
+    # Basic prerequisites - ADD ARCHIVE TOOLS
+    - name: Install prerequisites including archive tools
       apt:
         name:
           - wget
           - curl
+          - gnupg2
           - apt-transport-https
           - software-properties-common
+          - unixodbc-dev
+          - bzip2
+          - tar
+        state: present
+        update_cache: yes
+
+    # Microsoft GPG Keys
+    - name: Add Microsoft GPG key for repositories
+      apt_key:
+        url: https://packages.microsoft.com/keys/microsoft.asc
         state: present
 
-    # Install .NET 9 SDK
-    - name: Add Microsoft package repo for .NET
-      shell: |
-        wget https://packages.microsoft.com/config/ubuntu/22.04/packages-microsoft-prod.deb -O packages-microsoft-prod.deb
-        dpkg -i packages-microsoft-prod.deb
-      args:
-        creates: /etc/apt/sources.list.d/microsoft-prod.list
+    - name: Add Microsoft package repository for .NET
+      apt_repository:
+        repo: "deb [arch=amd64] https://packages.microsoft.com/ubuntu/{{ ubuntu_version }}/prod jammy main"
+        state: present
+        filename: microsoft-prod
+
+    - name: Update apt cache after adding Microsoft repo
+      apt:
+        update_cache: yes
 
     - name: Install .NET 9 SDK
       apt:
         name: dotnet-sdk-9.0
         state: present
-        update_cache: yes
 
-    # Install SQL Server 2022
-    - name: Add Microsoft SQL Server repo
-      shell: |
-        curl https://packages.microsoft.com/keys/microsoft.asc | apt-key add -
-        add-apt-repository "$(curl -s https://packages.microsoft.com/config/ubuntu/22.04/mssql-server-2022.list)"
-      args:
-        creates: /etc/apt/sources.list.d/mssql-server-2022.list
+    # SQL Server Tools - SIMPLIFIED APPROACH
+    - name: Install SQL Server ODBC driver
+      environment:
+        ACCEPT_EULA: "Y"
+      apt:
+        name: msodbcsql18
+        state: present
+
+    - name: Install SQL Server tools
+      environment:
+        ACCEPT_EULA: "Y"
+      apt:
+        name: mssql-tools18
+        state: present
+
+    # SQL Server Engine Installation
+    - name: Add SQL Server repository
+      apt_repository:
+        repo: "deb [arch=amd64] https://packages.microsoft.com/ubuntu/{{ ubuntu_version }}/mssql-server-2022 jammy main"
+        state: present
+        filename: mssql-server
+
+    - name: Update apt cache for SQL Server
+      apt:
+        update_cache: yes
 
     - name: Install SQL Server
       apt:
         name: mssql-server
         state: present
-        update_cache: yes
 
-    - name: Install SQL Server tools
-      apt:
-        name:
-          - mssql-tools
-          - unixodbc-dev
-        state: present
-        update_cache: yes
-
-    - name: Initialize SQL Server
+    - name: Configure SQL Server
       shell: |
-        MSSQL_SA_PASSWORD='YourStrong!Passw0rd' \
-        MSSQL_PID=Developer \
+        MSSQL_SA_PASSWORD='{{ mssql_sa_password }}' \
+        MSSQL_PID='Developer' \
         /opt/mssql/bin/mssql-conf -n setup accept-eula
       args:
-        creates: /var/opt/mssql/data
+        creates: /var/opt/mssql/data/master.mdf
 
-    - name: Enable SQL Server service
+    - name: Ensure SQL Server service is running
       systemd:
         name: mssql-server
         state: started
         enabled: yes
+        daemon_reload: yes
+
+    - name: Wait for SQL Server to be ready
+      wait_for:
+        port: 1433
+        host: localhost
+        delay: 15
+        timeout: 180
+
+    # Find and setup sqlcmd properly
+    - name: Find sqlcmd installation
+      find:
+        paths: 
+          - /opt/mssql-tools
+          - /usr
+        patterns: "sqlcmd"
+        file_type: file
+        use_regex: no
+      register: sqlcmd_location
+
+    - name: Create sqlcmd symlink if found
+      file:
+        src: "{{ sqlcmd_location.files[0].path }}"
+        dest: /usr/local/bin/sqlcmd
+        state: link
+        force: yes
+      when: sqlcmd_location.files | length > 0
+
+    # ALTERNATIVE: Install sqlcmd from different source if not found
+    - name: Download and install sqlcmd from alternative source
+      block:
+        - name: Download sqlcmd deb package
+          get_url:
+            url: https://github.com/microsoft/go-sqlcmd/releases/download/v0.9.1/sqlcmd_0.9.1_linux_amd64.deb
+            dest: /tmp/sqlcmd.deb
+
+        - name: Install sqlcmd from deb package
+          apt:
+            deb: /tmp/sqlcmd.deb
+
+        - name: Clean up deb package
+          file:
+            path: /tmp/sqlcmd.deb
+            state: absent
+      when: sqlcmd_location.files | length == 0
+
+    # Final verification and diagnostics
+    - name: Check SQL Server service status
+      systemd:
+        name: mssql-server
+      register: sql_service_status
+
+    - name: Check SQL Server port
+      wait_for:
+        port: 1433
+        host: localhost
+        timeout: 5
+      register: sql_port_status
+
+    - name: Test SQL Server connection
+      shell: |
+        sqlcmd -S localhost -U SA -P "{{ mssql_sa_password }}" \
+        -Q "SELECT @@VERSION" -b
+      register: sql_connection_test
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Display comprehensive installation report
+      debug:
+        msg: |
+          🚀 SPORTSTORE ENVIRONMENT SETUP REPORT
+          =====================================
+          ✅ .NET 9 SDK: Installed
+          ✅ SQL Server Engine: {{ 'RUNNING' if sql_service_status.status.ActiveState == 'active' else 'STOPPED' }}
+          ✅ SQL Server Port: {{ 'LISTENING' if sql_port_status is succeeded else 'CLOSED' }}
+          {% if sqlcmd_location.files | length > 0 %}
+          ✅ SQLCMD Tools: Found at {{ sqlcmd_location.files[0].path }}
+          {% else %}
+          ⚠️ SQLCMD Tools: Using alternative installation
+          {% endif %}
+          {% if sql_connection_test is succeeded %}
+          ✅ Database Connection: SUCCESSFUL
+          {% else %}
+          ⚠️ Database Connection: Manual verification needed
+          {% endif %}
+
+          🔧 MANUAL VERIFICATION COMMANDS:
+          ================================
+          Check SQL Server: systemctl status mssql-server
+          Test connection: sqlcmd -S localhost -U SA -P '{{ mssql_sa_password }}' -Q "SELECT @@VERSION"
+          Check logs: tail -f /var/opt/mssql/log/errorlog
