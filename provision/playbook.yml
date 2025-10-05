@@ -5,13 +5,13 @@
   vars:
     dotnet_version: "9.0"
     db_password: "YourPassword123!"
-    app_directory: "/opt/sportstore"
     db_name: "sportstore"
     db_user: "sportstore_user"
+    app_directory: "/opt/sportstore"
     ansible_python_interpreter: /usr/bin/python3
 
   tasks:
-    # --- Update system and install basic packages ---
+    # --- System preparation ---
     - name: Update apt cache
       apt:
         update_cache: yes
@@ -28,13 +28,12 @@
           - python3-pip
         state: present
 
-    # --- Install Python MySQL client for Ansible ---
-    - name: Install Python MySQL client
+    - name: Install Python MySQL client for Ansible
       pip:
         name: PyMySQL
         executable: pip3
 
-    # --- .NET SDK Installation ---
+    # --- Install .NET SDK ---
     - name: Add Microsoft package repository for .NET
       apt_key:
         url: https://packages.microsoft.com/keys/microsoft.asc
@@ -49,24 +48,16 @@
 
     - name: Install .NET 9 SDK
       apt:
-        name: dotnet-sdk-{{ dotnet_version }}
+        name: "dotnet-sdk-{{ dotnet_version }}"
         state: present
         update_cache: yes
 
     - name: Install ASP.NET Core runtime
       apt:
-        name: aspnetcore-runtime-{{ dotnet_version }}
+        name: "aspnetcore-runtime-{{ dotnet_version }}"
         state: present
 
-# --- MariaDB Setup ---
-- name: Configure MariaDB
-  hosts: all
-  become: yes
-  vars:
-    db_password: "YourPassword123!"
-    db_name: "sportstore"
-    db_user: "sportstore_user"
-  tasks:
+    # --- MariaDB Setup ---
     - name: Install MariaDB server and client
       apt:
         name:
@@ -84,11 +75,11 @@
     - name: Wait for MariaDB to start
       wait_for:
         port: 3306
-        delay: 10
-        timeout: 60
+        delay: 5
+        timeout: 90
 
-    # First, try to connect without password to set initial root password
-    - name: Check if root can connect without password
+    # --- Configure root password safely ---
+    - name: Try connecting as root via socket (no password)
       mysql_query:
         query: "SELECT 1"
         login_unix_socket: /var/run/mysqld/mysqld.sock
@@ -96,7 +87,7 @@
       ignore_errors: yes
       changed_when: false
 
-    - name: Set root password if no password is set
+    - name: Set root password if not set
       mysql_user:
         name: root
         host: localhost
@@ -106,42 +97,6 @@
         state: present
       when: root_access is succeeded
 
-    - name: Alternative method - use debconf to set password
-      debconf:
-        name: mariadb-server
-        question: "mysql-server/root_password"
-        value: "{{ db_password }}"
-        vtype: "password"
-      when: root_access is failed
-
-    - name: Alternative method - set password confirmation
-      debconf:
-        name: mariadb-server
-        question: "mysql-server/root_password_again"
-        value: "{{ db_password }}"
-        vtype: "password"
-      when: root_access is failed
-
-    - name: Reconfigure MariaDB to apply password
-      dpkg_selections:
-        name: mariadb-server
-        selection: reconfigure
-      when: root_access is failed
-
-    - name: Restart MariaDB to apply changes
-      systemd:
-        name: mariadb
-        state: restarted
-      when: root_access is failed
-
-    - name: Wait for MariaDB to restart
-      wait_for:
-        port: 3306
-        delay: 10
-        timeout: 60
-      when: root_access is failed
-
-    # Now try to connect with the password
     - name: Verify root password works
       mysql_query:
         query: "SELECT 1"
@@ -151,31 +106,7 @@
       ignore_errors: yes
       changed_when: false
 
-    # If password verification fails, use emergency reset method
-    - name: Emergency reset of root password
-      shell: |
-        sudo systemctl stop mariadb
-        sudo mysqld_safe --skip-grant-tables --skip-networking &
-        sleep 5
-        mysql -u root << EOF
-        FLUSH PRIVILEGES;
-        ALTER USER 'root'@'localhost' IDENTIFIED BY '{{ db_password }}';
-        FLUSH PRIVILEGES;
-        EXIT;
-        EOF
-        sudo pkill mysqld_safe
-        sudo systemctl start mariadb
-      when: password_verify is failed
-      args:
-        warn: no
-
-    - name: Final wait for MariaDB
-      wait_for:
-        port: 3306
-        delay: 5
-        timeout: 30
-
-    # Now proceed with database setup
+    # --- Database configuration ---
     - name: Remove anonymous users
       mysql_user:
         name: ""
@@ -216,7 +147,7 @@
         state: present
         login_user: root
         login_password: "{{ db_password }}"
-      with_items:
+      loop:
         - localhost
         - 127.0.0.1
         - ::1
@@ -242,22 +173,45 @@
         state: directory
         mode: '0755'
 
-    - name: Create appsettings.Development.json template
-      template:
-        src: templates/appsettings.Development.json.j2
+    - name: Copy application source to deployment directory
+      copy:
+        src: /vagrant/src/
+        dest: "{{ app_directory }}/"
+        owner: www-data
+        group: www-data
+        mode: '0755'
+
+    # Create configuration file directly instead of using template
+    - name: Create appsettings.Development.json
+      copy:
+        content: |
+          {
+            "ConnectionStrings": {
+              "SportStoreConnection": "Server=localhost;Database={{ db_name }};User={{ db_user }};Password={{ db_password }};"
+            },
+            "Logging": {
+              "LogLevel": {
+                "Default": "Information",
+                "Microsoft.AspNetCore": "Warning"
+              }
+            }
+          }
         dest: "{{ app_directory }}/appsettings.Development.json"
         mode: '0644'
 
+    # Create startup script directly
     - name: Create startup script
-      template:
-        src: templates/start-app.sh.j2
+      copy:
+        content: |
+          #!/bin/bash
+          cd {{ app_directory }}
+          export DOTNET_ROOT=/usr/lib/dotnet
+          export PATH=$PATH:/usr/lib/dotnet
+          dotnet run --urls "http://0.0.0.0:5000"
         dest: "{{ app_directory }}/start-app.sh"
         mode: '0755'
 
-- name: Configure firewall
-  hosts: all
-  become: yes
-  tasks:
+    # --- Firewall configuration ---
     - name: Install ufw
       apt:
         name: ufw
@@ -279,10 +233,4 @@
       ufw:
         rule: allow
         port: "5000"
-        state: enabled
-
-    - name: Allow MariaDB
-      ufw:
-        rule: allow
-        port: "3306"
         state: enabled
