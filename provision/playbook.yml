@@ -1,236 +1,77 @@
 ---
-- name: Configure SportStore development environment
+- name: Setup SportStore application environment
   hosts: all
   become: yes
   vars:
-    dotnet_version: "9.0"
-    db_password: "YourPassword123!"
-    db_name: "sportstore"
-    db_user: "sportstore_user"
-    app_directory: "/opt/sportstore"
-    ansible_python_interpreter: /usr/bin/python3
+    mssql_sa_password: "YourStrong!Passw0rd"
+    sql_port: 1433
+    app_port: 5000
+    sportstore_path: "/vagrant"  # synced folder inside VM
+
 
   tasks:
-    # --- System preparation ---
-    - name: Update apt cache
-      apt:
-        update_cache: yes
-        cache_valid_time: 3600
-
-    - name: Install basic packages
+    - name: Ensure required packages are installed
       apt:
         name:
-          - curl
-          - wget
-          - gnupg
-          - software-properties-common
-          - apt-transport-https
-          - python3-pip
-        state: present
-
-    - name: Install Python MySQL client for Ansible
-      pip:
-        name: PyMySQL
-        executable: pip3
-
-    # --- Install .NET SDK ---
-    - name: Add Microsoft package repository for .NET
-      apt_key:
-        url: https://packages.microsoft.com/keys/microsoft.asc
-        state: present
-      when: ansible_os_family == "Debian"
-
-    - name: Add Microsoft repository
-      apt_repository:
-        repo: "deb [arch=amd64] https://packages.microsoft.com/ubuntu/20.04/prod focal main"
-        state: present
-        filename: "microsoft"
-
-    - name: Install .NET 9 SDK
-      apt:
-        name: "dotnet-sdk-{{ dotnet_version }}"
+          - docker.io
+          - docker-compose
         state: present
         update_cache: yes
 
-    - name: Install ASP.NET Core runtime
-      apt:
-        name: "aspnetcore-runtime-{{ dotnet_version }}"
-        state: present
-
-    # --- MariaDB Setup ---
-    - name: Install MariaDB server and client
-      apt:
-        name:
-          - mariadb-server
-          - mariadb-client
-        state: present
-        update_cache: yes
-
-    - name: Ensure MariaDB is started and enabled
-      systemd:
-        name: mariadb
+    - name: Start Docker service
+      service:
+        name: docker
         state: started
         enabled: yes
 
-    - name: Wait for MariaDB to start
+    - name: Create Docker network for SportStore
+      docker_network:
+        name: sportstore-net
+        state: present
+
+    - name: Run SQL Server container
+      docker_container:
+        name: sportstore-sql
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        state: started
+        restart_policy: always
+        networks:
+          - name: sportstore-net
+        ports:
+          - "{{ sql_port }}:1433"
+        env:
+          ACCEPT_EULA: "Y"
+          SA_PASSWORD: "{{ mssql_sa_password }}"
+
+    - name: Wait for SQL Server to be ready
       wait_for:
-        port: 3306
-        delay: 5
-        timeout: 90
+        host: "127.0.0.1"
+        port: "{{ sql_port }}"
+        delay: 10
+        timeout: 60
 
-    # --- Configure root password safely ---
-    - name: Try connecting as root via socket (no password)
-      mysql_query:
-        query: "SELECT 1"
-        login_unix_socket: /var/run/mysqld/mysqld.sock
-      register: root_access
-      ignore_errors: yes
-      changed_when: false
+    - name: Build and run SportStore server container
+      docker_container:
+        name: sportstore-server
+        image: mcr.microsoft.com/dotnet/sdk:6.0
 
-    - name: Set root password if not set
-      mysql_user:
-        name: root
-        host: localhost
-        password: "{{ db_password }}"
-        login_unix_socket: /var/run/mysqld/mysqld.sock
-        check_implicit_admin: yes
-        state: present
-      when: root_access is succeeded
+        state: started
+        restart_policy: always
+        networks:
+          - name: sportstore-net
+        ports:
+          - "{{ app_port }}:80"
+        volumes:
+          - "{{ sportstore_path }}:/app"
 
-    - name: Verify root password works
-      mysql_query:
-        query: "SELECT 1"
-        login_user: root
-        login_password: "{{ db_password }}"
-      register: password_verify
-      ignore_errors: yes
-      changed_when: false
 
-    # --- Database configuration ---
-    - name: Remove anonymous users
-      mysql_user:
-        name: ""
-        host_all: yes
-        state: absent
-        login_user: root
-        login_password: "{{ db_password }}"
+        command: >
+          /bin/bash -c "cd /app/src/Server && dotnet restore Server.csproj && dotnet build Server.csproj && dotnet run --urls=http://0.0.0.0:80"
 
-    - name: Remove test database
-      mysql_db:
-        name: test
-        state: absent
-        login_user: root
-        login_password: "{{ db_password }}"
+        env:
+          DOTNET_Environment: Development
+          DOTNET_ConnectionStrings__SqlDatabase: "Server=sportstore-sql,1433;Database=master;User Id=sa;Password={{ mssql_sa_password }};TrustServerCertificate=True"
 
-    - name: Create application database
-      mysql_db:
-        name: "{{ db_name }}"
-        state: present
-        login_user: root
-        login_password: "{{ db_password }}"
-
-    - name: Create application user
-      mysql_user:
-        name: "{{ db_user }}"
-        password: "{{ db_password }}"
-        priv: "{{ db_name }}.*:ALL"
-        host: "%"
-        state: present
-        login_user: root
-        login_password: "{{ db_password }}"
-
-    - name: Ensure root user has localhost access only
-      mysql_user:
-        name: root
-        host: "{{ item }}"
-        password: "{{ db_password }}"
-        state: present
-        login_user: root
-        login_password: "{{ db_password }}"
-      loop:
-        - localhost
-        - 127.0.0.1
-        - ::1
-
-    - name: Remove any root user with wildcard host
-      mysql_user:
-        name: root
-        host: "%"
-        state: absent
-        login_user: root
-        login_password: "{{ db_password }}"
-
-    - name: Flush privileges
-      mysql_query:
-        query: "FLUSH PRIVILEGES"
-        login_user: root
-        login_password: "{{ db_password }}"
-
-    # --- Application Setup ---
-    - name: Create application directory
-      file:
-        path: "{{ app_directory }}"
-        state: directory
-        mode: '0755'
-
-    - name: Copy application source to deployment directory
-      copy:
-        src: /vagrant/src/
-        dest: "{{ app_directory }}/"
-        owner: www-data
-        group: www-data
-        mode: '0755'
-
-    # Create configuration file directly instead of using template
-    - name: Create appsettings.Development.json
-      copy:
-        content: |
-          {
-            "ConnectionStrings": {
-              "SportStoreConnection": "Server=localhost;Database={{ db_name }};User={{ db_user }};Password={{ db_password }};"
-            },
-            "Logging": {
-              "LogLevel": {
-                "Default": "Information",
-                "Microsoft.AspNetCore": "Warning"
-              }
-            }
-          }
-        dest: "{{ app_directory }}/appsettings.Development.json"
-        mode: '0644'
-
-    # Create startup script directly
-    - name: Create startup script
-      copy:
-        content: |
-          #!/bin/bash
-          cd {{ app_directory }}
-          export DOTNET_ROOT=/usr/lib/dotnet
-          export PATH=$PATH:/usr/lib/dotnet
-          dotnet run --urls "http://0.0.0.0:5000"
-        dest: "{{ app_directory }}/start-app.sh"
-        mode: '0755'
-
-    # --- Firewall configuration ---
-    - name: Install ufw
-      apt:
-        name: ufw
-        state: present
-
-    - name: Allow SSH
-      ufw:
-        rule: allow
-        port: ssh
-        state: enabled
-
-    - name: Allow HTTP
-      ufw:
-        rule: allow
-        port: "80"
-        state: enabled
-
-    - name: Allow port 5000 (ASP.NET dev server)
-      ufw:
-        rule: allow
-        port: "5000"
-        state: enabled
+    - name: Inform user
+      debug:
+        msg: "SportStore is now running! Access it at http://localhost:{{ app_port }}"
