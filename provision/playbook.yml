@@ -1,22 +1,25 @@
----
-- name: Setup SportStore application environment
+- name: Setup SportStore application environment using Docker Compose
   hosts: all
   become: yes
   vars:
-    mssql_sa_password: "YourStrong!Passw0rd"
-    sql_port: 1433
-    app_port: 5000
-    sportstore_path: "/vagrant"  # synced folder inside VM
-
+    sportstore_path: "/vagrant"
 
   tasks:
     - name: Ensure required packages are installed
       apt:
         name:
           - docker.io
-          - docker-compose
+          - curl
         state: present
         update_cache: yes
+
+    - name: Install Docker Compose v2
+      shell: |
+        mkdir -p ~/.docker/cli-plugins/
+        curl -SL https://github.com/docker/compose/releases/download/v2.24.0/docker-compose-linux-x86_64 -o ~/.docker/cli-plugins/docker-compose
+        chmod +x ~/.docker/cli-plugins/docker-compose
+      args:
+        executable: /bin/bash
 
     - name: Start Docker service
       service:
@@ -24,54 +27,31 @@
         state: started
         enabled: yes
 
-    - name: Create Docker network for SportStore
-      docker_network:
-        name: sportstore-net
-        state: present
+    - name: Remove old SportStore containers if they exist
+      shell: |
+        docker rm -f sportstore-sql sportstore-server || true
+      args:
+        executable: /bin/bash
 
-    - name: Run SQL Server container
-      docker_container:
-        name: sportstore-sql
-        image: mcr.microsoft.com/mssql/server:2022-latest
-        state: started
-        restart_policy: always
-        networks:
-          - name: sportstore-net
-        ports:
-          - "{{ sql_port }}:1433"
-        env:
-          ACCEPT_EULA: "Y"
-          SA_PASSWORD: "{{ mssql_sa_password }}"
+    - name: Start containers with Docker Compose
+      shell: |
+        docker compose -f {{ sportstore_path }}/docker-compose.yml up -d --remove-orphans
+      args:
+        executable: /bin/bash
+      register: compose_output
+      ignore_errors: no
 
-    - name: Wait for SQL Server to be ready
+    - name: Show Docker Compose output
+      debug:
+        var: compose_output.stdout_lines
+
+    - name: Wait for application to start
       wait_for:
         host: "127.0.0.1"
-        port: "{{ sql_port }}"
-        delay: 10
-        timeout: 60
-
-    - name: Build and run SportStore server container
-      docker_container:
-        name: sportstore-server
-        image: mcr.microsoft.com/dotnet/sdk:6.0
-
-        state: started
-        restart_policy: always
-        networks:
-          - name: sportstore-net
-        ports:
-          - "{{ app_port }}:80"
-        volumes:
-          - "{{ sportstore_path }}:/app"
-
-
-        command: >
-          /bin/bash -c "cd /app/src/Server && dotnet restore Server.csproj && dotnet build Server.csproj && dotnet run --urls=http://0.0.0.0:80"
-
-        env:
-          DOTNET_Environment: Development
-          DOTNET_ConnectionStrings__SqlDatabase: "Server=sportstore-sql,1433;Database=master;User Id=sa;Password={{ mssql_sa_password }};TrustServerCertificate=True"
+        port: 5000
+        delay: 30
+        timeout: 120
 
     - name: Inform user
       debug:
-        msg: "SportStore is now running! Access it at http://localhost:{{ app_port }}"
+        msg: "SportStore is now running! Access it at http://localhost:5000"
